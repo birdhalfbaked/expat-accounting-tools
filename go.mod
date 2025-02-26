@@ -7,3 +7,5 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.24 // direct
 	golang.org/x/text v0.22.0 // direct
 )
+
+require github.com/spf13/pflag v1.0.6 // indirect

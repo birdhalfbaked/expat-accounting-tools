@@ -12,23 +12,68 @@ import (
 
 var GlobalDB *sql.DB
 
+func getDbDecimalValue(val *decimal.Big) int64 {
+	uintVal, _ := val.Mantissa()
+	intVal := int64(uintVal)
+	if val.Cmp(ZeroPrecisionValue) == -1 {
+		return -1 * intVal
+	}
+	return intVal
+}
+
 /**
 ASSET LOT DATA ACCESS
 */
-// GetAssetLotsByISIN returns a list of AssetLots when given an ISIN
-func GetAssetLotByISIN(isin string, openOnly bool) ([]AssetLot, error) {
+// GetAssetLotsBySymbol returns a list of AssetLots when given a symbol
+func GetAssetLotBySymbol(symbol string, openOnly bool) ([]AssetLot, error) {
 	sql := `
 	SELECT
 		id, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
 	FROM asset_lots
-	WHERE isin = ? AND shares > ?
+	WHERE symbol = ? AND shares > ?
 	ORDER BY cost_basis_per_share DESC;
 	`
 	shareLimit := -1
 	if openOnly {
 		shareLimit = 0
 	}
-	rows, err := GlobalDB.Query(sql, isin, shareLimit)
+	rows, err := GlobalDB.Query(sql, symbol, shareLimit)
+	if err != nil {
+		return nil, err
+	}
+	var results = make([]AssetLot, 0)
+	for rows.Next() {
+		var shares, cost_basis_per_share int64
+		var assetLot AssetLot
+		err = rows.Scan(
+			&assetLot.ID,
+			&assetLot.Symbol,
+			&assetLot.ISIN,
+			&shares,
+			&cost_basis_per_share,
+			&assetLot.CostBasisCurrency,
+			&assetLot.CreatedDate,
+		)
+		assetLot.Shares = decimal.New(shares, 4)
+		assetLot.CostBasisPerShare = decimal.New(cost_basis_per_share, 4)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, assetLot)
+	}
+	return results, err
+}
+
+// GetOpenAssetLotsBySymbolBeforeDate returns a list of AssetLots when given a symbol
+func GetOpenAssetLotsBySymbolBeforeDate(symbol string, date time.Time) ([]AssetLot, error) {
+	sql := `
+	SELECT
+		id, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
+	FROM asset_lots
+	WHERE symbol = ? AND shares > 0 AND created_date < ?
+	ORDER BY cost_basis_per_share DESC;
+	`
+	rows, err := GlobalDB.Query(sql, symbol, date.Format("2006-01-02"))
 	if err != nil {
 		return nil, err
 	}
@@ -94,13 +139,13 @@ func InsertAssetLot(assetLot AssetLot, tx *sql.Tx) (string, error) {
 	derivedIdCountSQL := `
 	SELECT COUNT(*)+1
 	FROM asset_lots
-	WHERE isin = ?;
+	WHERE symbol = ?;
 	`
 
-	derivedId := assetLot.ISIN + assetLot.CreatedDate.Format("-20060102")
+	derivedId := assetLot.Symbol + assetLot.CreatedDate.Format("-20060102")
 	var idCount int
 
-	row := tx.QueryRow(derivedIdCountSQL, assetLot.ISIN)
+	row := tx.QueryRow(derivedIdCountSQL, assetLot.Symbol)
 	row.Scan(&idCount)
 	derivedId += fmt.Sprintf("-%06d", idCount)
 
@@ -113,8 +158,9 @@ func InsertAssetLot(assetLot AssetLot, tx *sql.Tx) (string, error) {
 			return "", err
 		}
 	}
-	var shares, _ = assetLot.Shares.Mantissa()
-	var costBasisPerShare, _ = assetLot.CostBasisPerShare.Mantissa()
+	var shares = getDbDecimalValue(assetLot.Shares)
+	var costBasisPerShare = getDbDecimalValue(assetLot.CostBasisPerShare)
+	assetLot.ID = derivedId
 	_, err = tx.Exec(sql,
 		derivedId, assetLot.Symbol, assetLot.ISIN, shares,
 		costBasisPerShare, assetLot.CostBasisCurrency, assetLot.CreatedDate,
@@ -123,6 +169,7 @@ func InsertAssetLot(assetLot AssetLot, tx *sql.Tx) (string, error) {
 		ErrLogger.Println(derivedId)
 		return "", err
 	}
+	InsertAssetLotHistory(assetLot, assetLot.CreatedDate, tx)
 	if immediateCommit {
 		err = tx.Commit()
 		if err != nil {
@@ -130,6 +177,42 @@ func InsertAssetLot(assetLot AssetLot, tx *sql.Tx) (string, error) {
 		}
 	}
 	return derivedId, err
+}
+
+// InsertAssetLotHistory inserts a asset lot record and then returns
+func InsertAssetLotHistory(assetLot AssetLot, asOfDate time.Time, tx *sql.Tx) error {
+	sql := `
+	INSERT INTO asset_lots_history (
+		id, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, as_of_date
+	) VALUES (?, ?, ?, ?, ?, ?, ?);
+	`
+
+	immediateCommit := false
+	var err error
+	if tx == nil {
+		immediateCommit = true
+		tx, err = GlobalDB.Begin()
+		if err != nil {
+			return err
+		}
+	}
+	var shares = getDbDecimalValue(assetLot.Shares)
+	var costBasisPerShare = getDbDecimalValue(assetLot.CostBasisPerShare)
+	_, err = tx.Exec(sql,
+		assetLot.ID, assetLot.Symbol, assetLot.ISIN, shares,
+		costBasisPerShare, assetLot.CostBasisCurrency, asOfDate,
+	)
+	if err != nil {
+		ErrLogger.Println(assetLot.ID)
+		return err
+	}
+	if immediateCommit {
+		err = tx.Commit()
+		if err != nil {
+			return err
+		}
+	}
+	return err
 }
 
 // UpdateAssetLot updates a asset lot record
@@ -190,6 +273,7 @@ func GetTransactionBetweenDate(startDate time.Time, endDate time.Time) ([]Transa
 			&transaction.TransactionReference,
 			&transaction.TransactionType,
 			&transaction.SettlementDate,
+			&transaction.Symbol,
 			&transaction.ShareLot,
 			&shares,
 			&pricePerShare,
@@ -215,7 +299,7 @@ func GetTransactionBetweenDate(startDate time.Time, endDate time.Time) ([]Transa
 func GetTransactionById(id int) (Transaction, error) {
 	sql := `
 	SELECT
-		id, transaction_reference, transaction_type, settlement_date,
+		id, transaction_reference, transaction_type, settlement_date, symbol,
 		share_lot, shares, price_per_share, share_value, fees_amount,
 		total_amount, currency
 	FROM transactions
@@ -229,6 +313,7 @@ func GetTransactionById(id int) (Transaction, error) {
 		&transaction.TransactionReference,
 		&transaction.TransactionType,
 		&transaction.SettlementDate,
+		&transaction.Symbol,
 		&transaction.ShareLot,
 		&shares,
 		&pricePerShare,
@@ -253,10 +338,10 @@ func GetTransactionById(id int) (Transaction, error) {
 func InsertTransaction(transaction Transaction, tx *sql.Tx) (int, error) {
 	sql := `
 	INSERT INTO transactions (
-		transaction_reference, transaction_type, settlement_date,
+		transaction_reference, transaction_type, settlement_date, symbol,
 		share_lot, shares, price_per_share, share_value, fees_amount,
 		total_amount, currency
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 	`
 	immediateCommit := false
 	var err error
@@ -267,13 +352,13 @@ func InsertTransaction(transaction Transaction, tx *sql.Tx) (int, error) {
 			return -1, err
 		}
 	}
-	shares, _ := transaction.Shares.Mantissa()
-	pricePerShare, _ := transaction.PricePerShare.Mantissa()
-	shareValue, _ := transaction.ShareValue.Mantissa()
-	feesAmount, _ := transaction.FeesAmount.Mantissa()
-	totalAmount, _ := transaction.TotalAmount.Mantissa()
+	shares := getDbDecimalValue(transaction.Shares)
+	pricePerShare := getDbDecimalValue(transaction.PricePerShare)
+	shareValue := getDbDecimalValue(transaction.ShareValue)
+	feesAmount := getDbDecimalValue(transaction.FeesAmount)
+	totalAmount := getDbDecimalValue(transaction.TotalAmount)
 	result, err := tx.Exec(sql, transaction.TransactionReference, transaction.TransactionType, transaction.SettlementDate,
-		transaction.ShareLot, shares, pricePerShare, shareValue, feesAmount,
+		transaction.Symbol, transaction.ShareLot, shares, pricePerShare, shareValue, feesAmount,
 		totalAmount, transaction.Currency)
 	if err != nil {
 		return -1, err
@@ -288,12 +373,44 @@ func InsertTransaction(transaction Transaction, tx *sql.Tx) (int, error) {
 	return int(lastId), err
 }
 
+func UpdateRates() {
+	supportedCurrenciesInsert := `
+	INSERT INTO "supported_currencies" (id, name)
+		SELECT "USD", "US Dollar"
+		UNION ALL
+		SELECT "SEK", "Svensk krona"
+	`
+	insertCurrencyRatesTable := `
+	INSERT INTO "currency_rates" (currency_code, rate, as_of_date)
+		SELECT 'USD', 10000, '2022-12-31'
+		UNION ALL
+		SELECT 'USD', 10000, '2023-12-31'
+		UNION ALL
+		SELECT 'USD', 10000, '2024-12-31'
+		UNION ALL
+		SELECT 'SEK', 101220, '2022-12-31'
+		UNION ALL
+		SELECT 'SEK', 106130, '2023-12-31'
+		UNION ALL
+		SELECT 'SEK', 105770, '2024-12-31'
+	`
+	tx, _ := GlobalDB.Begin()
+	tx.Exec(supportedCurrenciesInsert)
+	tx.Exec(insertCurrencyRatesTable)
+}
+
 /*
 *
 
 	INITIALIZATION
 */
 func createTables() {
+	supportedCurrenciesTable := `
+	CREATE TABLE IF NOT EXISTS "supported_currencies" (
+		 id                   	CHAR(3) PRIMARY KEY
+		,name      				TEXT NOT NULL
+	)
+	`
 	lotsTable := `
 	CREATE TABLE IF NOT EXISTS "asset_lots" (
 		 id                   	TEXT PRIMARY KEY
@@ -304,6 +421,21 @@ func createTables() {
 		,cost_basis_per_share   TEXT
 		,cost_basis_currency   	BIGINT
 		,created_date   		TIMESTAMP NOT NULL
+		,FOREIGN KEY (cost_basis_currency) REFERENCES supported_currencies(id)
+	)
+	`
+	lotsHistoryTable := `
+	CREATE TABLE IF NOT EXISTS "asset_lots_history" (
+		 int_id                 INTEGER PRIMARY KEY AUTOINCREMENT
+		,id                   	TEXT
+		,symbol				 	TEXT NOT NULL
+		,isin      				TEXT NOT NULL
+		,shares       			BIGINT NOT NULL
+
+		,cost_basis_per_share   TEXT
+		,cost_basis_currency   	BIGINT
+		,as_of_date   			TIMESTAMP NOT NULL
+		,FOREIGN KEY (cost_basis_currency) REFERENCES supported_currencies(id)
 	)
 	`
 	transactionsTable := `
@@ -313,6 +445,7 @@ func createTables() {
 		,transaction_type      	SMALLINT NOT NULL
 		,settlement_date       	TIMESTAMP NOT NULL
 
+		,symbol					TEXT
 		,share_lot      		TEXT
 		,shares        			BIGINT
 		,price_per_share 		BIGINT
@@ -323,15 +456,54 @@ func createTables() {
 		,total_amount 			BIGINT NOT NULL
 		,currency    			CHAR(3) NOT NULL
 		,FOREIGN KEY (share_lot) REFERENCES asset_lots(id)
-	)
+		,FOREIGN KEY (currency) REFERENCES supported_currencies(id)
+		)
+	`
+	currencyRatesTable := `
+		CREATE TABLE IF NOT EXISTS "currency_rates" (
+			id                   	INTEGER PRIMARY KEY AUTOINCREMENT
+			,currency_code 			CHAR(3)
+			,rate 		     		BIGINT -- how much to one USD
+			,as_of_date    			TIMESTAMP
+			,FOREIGN KEY (currency_code) REFERENCES supported_currencies(id)
+		)
+	`
+
+	marketMarksTable := `
+		CREATE TABLE IF NOT EXISTS "market_marks" (
+			id                   		INTEGER PRIMARY KEY AUTOINCREMENT
+			,asset_lot_id 				TEXT
+			,market_mark_date			TIMESTAMP
+			,marked_value_per_share 	BIGINT
+			,marked_value_currency		CHAR(3)
+			,gain_loss				 	BIGINT
+			,FOREIGN KEY (asset_lot_id) REFERENCES asset_lots(id)
+			,FOREIGN KEY (marked_value_currency) REFERENCES supported_currencies(id)
+		)
 	`
 
 	tx, _ := GlobalDB.Begin()
-	_, err := tx.Exec(lotsTable)
+	_, err := tx.Exec(supportedCurrenciesTable)
+	if err != nil {
+		ErrLogger.Fatal(err)
+	}
+	_, err = tx.Exec(lotsTable)
+	if err != nil {
+		ErrLogger.Fatal(err)
+	}
+	_, err = tx.Exec(lotsHistoryTable)
 	if err != nil {
 		ErrLogger.Fatal(err)
 	}
 	_, err = tx.Exec(transactionsTable)
+	if err != nil {
+		ErrLogger.Fatal(err)
+	}
+	_, err = tx.Exec(currencyRatesTable)
+	if err != nil {
+		ErrLogger.Fatal(err)
+	}
+	_, err = tx.Exec(marketMarksTable)
 	if err != nil {
 		ErrLogger.Fatal(err)
 	}

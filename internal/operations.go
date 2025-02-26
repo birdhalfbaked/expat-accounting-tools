@@ -13,8 +13,14 @@ func HandleImport(records []ImportRecord) error {
 				ErrLogger.Println(err)
 				return err
 			}
-		case TRANSFERIN_TRANSACTION, SPLITIN_TRANSACTION:
-			err := handleTransferSplitInImport(record)
+		case TRANSFERIN_TRANSACTION:
+			err := handleTransferInImport(record)
+			if err != nil {
+				ErrLogger.Println(err)
+				return err
+			}
+		case SPLITIN_TRANSACTION:
+			err := handleSplitInImport(record)
 			if err != nil {
 				ErrLogger.Println(err)
 				return err
@@ -25,8 +31,20 @@ func HandleImport(records []ImportRecord) error {
 				ErrLogger.Println(err)
 				return err
 			}
-		case TRANSFEROUT_TRANSACTION, SPLITOUT_TRANSACTION:
-			err := handleTransferSplitOutImport(record)
+		case TRANSFEROUT_TRANSACTION:
+			err := handleTransferOutImport(record)
+			if err != nil {
+				ErrLogger.Println(err)
+				return err
+			}
+		case SPLITOUT_TRANSACTION:
+			err := handleSplitOutImport(record)
+			if err != nil {
+				ErrLogger.Println(err)
+				return err
+			}
+		case DIVIDEND:
+			_, err := InsertTransaction(record.transaction, nil)
 			if err != nil {
 				ErrLogger.Println(err)
 				return err
@@ -58,7 +76,38 @@ func handlePurchaseImport(record ImportRecord) error {
 	return nil
 }
 
-func handleTransferSplitInImport(record ImportRecord) error {
+func handleSplitInImport(record ImportRecord) error {
+	tx, err := GlobalDB.Begin()
+	if err != nil {
+		ErrLogger.Fatal(err)
+		return err
+	}
+	var newTotalCostBasis = decimal.New(0, 4)
+	beforeAssetLots, err := GetOpenAssetLotsBySymbolBeforeDate(record.transaction.Symbol, record.transaction.SettlementDate)
+	if err != nil {
+		return err
+	}
+	for _, lot := range beforeAssetLots {
+		newTotalCostBasis = newTotalCostBasis.Add(newTotalCostBasis, lot.CostBasisPerShare.Mul(lot.CostBasisPerShare, lot.Shares).Quantize(4))
+	}
+	record.lot.CostBasisPerShare = newTotalCostBasis.Quo(newTotalCostBasis, record.lot.Shares).Quantize(4)
+	lotId, err := InsertAssetLot(record.lot, tx)
+	if err != nil {
+		ErrLogger.Fatal(err)
+		return err
+	}
+	record.lot.ID = lotId
+	record.transaction.ShareLot = lotId
+	InsertTransaction(record.transaction, tx)
+	err = tx.Commit()
+	if err != nil {
+		ErrLogger.Fatal(err)
+		return err
+	}
+	return nil
+}
+
+func handleTransferInImport(record ImportRecord) error {
 	tx, err := GlobalDB.Begin()
 	if err != nil {
 		ErrLogger.Fatal(err)
@@ -85,7 +134,7 @@ func handleSaleImport(record ImportRecord) error {
 	if err != nil {
 		return err
 	}
-	lots, err := GetAssetLotByISIN(record.lot.ISIN, true)
+	lots, err := GetAssetLotBySymbol(record.lot.Symbol, true)
 	if err != nil {
 		ErrLogger.Println(err)
 		return err
@@ -119,6 +168,10 @@ func handleSaleImport(record ImportRecord) error {
 		if err != nil {
 			ErrLogger.Println(err)
 		}
+		err = InsertAssetLotHistory(lot, record.transaction.SettlementDate, tx)
+		if err != nil {
+			ErrLogger.Println(err)
+		}
 		transactionsProcessed++
 	}
 	err = tx.Commit()
@@ -128,12 +181,37 @@ func handleSaleImport(record ImportRecord) error {
 	return nil
 }
 
-func handleTransferSplitOutImport(record ImportRecord) error {
+func handleSplitOutImport(record ImportRecord) error {
 	tx, err := GlobalDB.Begin()
 	if err != nil {
 		return err
 	}
-	lots, err := GetAssetLotByISIN(record.lot.ISIN, true)
+	lots, err := GetOpenAssetLotsBySymbolBeforeDate(record.lot.Symbol, record.transaction.SettlementDate)
+	if err != nil {
+		ErrLogger.Println(err)
+		return err
+	}
+	for _, lot := range lots {
+		lot.Shares = ZeroPrecisionValue
+		err = UpdateAssetLot(lot, tx)
+		if err != nil {
+			return err
+		}
+		err = InsertAssetLotHistory(lot, record.transaction.SettlementDate, tx)
+		if err != nil {
+			ErrLogger.Println(err)
+		}
+	}
+	err = tx.Commit()
+	return err
+}
+
+func handleTransferOutImport(record ImportRecord) error {
+	tx, err := GlobalDB.Begin()
+	if err != nil {
+		return err
+	}
+	lots, err := GetAssetLotBySymbol(record.lot.Symbol, true)
 	if err != nil {
 		ErrLogger.Println(err)
 		return err
@@ -163,11 +241,12 @@ func handleTransferSplitOutImport(record ImportRecord) error {
 		if err != nil {
 			ErrLogger.Println(err)
 		}
+		err = InsertAssetLotHistory(lot, record.transaction.SettlementDate, tx)
+		if err != nil {
+			ErrLogger.Println(err)
+		}
 		transactionsProcessed++
 	}
 	err = tx.Commit()
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }

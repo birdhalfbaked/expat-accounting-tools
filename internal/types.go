@@ -69,7 +69,31 @@ const (
 	TRANSFEROUT_TRANSACTION
 	SPLITIN_TRANSACTION
 	SPLITOUT_TRANSACTION
+	DIVIDEND
+	QUALIFIED_DIVIDEND
 )
+
+func (t TransactionType) String() string {
+	switch t {
+	case SALE_TRANSACTION:
+		return "SALE_TRANSACTION"
+	case PURCHASE_TRANSACTION:
+		return "PURCHASE_TRANSACTION"
+	case DIVIDEND:
+		return "DIVIDEND"
+	case QUALIFIED_DIVIDEND:
+		return "QUALIFIED_DIVIDEND"
+	case SPLITOUT_TRANSACTION:
+		return "SPLITOUT_TRANSACTION"
+	case SPLITIN_TRANSACTION:
+		return "SPLITIN_TRANSACTION"
+	case TRANSFERIN_TRANSACTION:
+		return "TRANSFERIN_TRANSACTION"
+	case TRANSFEROUT_TRANSACTION:
+		return "TRANSFEROUT_TRANSACTION"
+	}
+	return "UNKNOWN"
+}
 
 /*
 ID
@@ -88,6 +112,7 @@ type Transaction struct {
 	TransactionType      TransactionType
 	SettlementDate       time.Time
 
+	Symbol        string
 	ShareLot      string
 	Shares        *decimal.Big
 	PricePerShare *decimal.Big
@@ -105,6 +130,7 @@ func (t Transaction) CopyFromShares(newShares *decimal.Big) Transaction {
 		t.TransactionReference,
 		t.TransactionType,
 		t.SettlementDate,
+		t.Symbol,
 		t.ShareLot,
 		newShares,
 		decimal.New(0, 4).Copy(t.PricePerShare),
