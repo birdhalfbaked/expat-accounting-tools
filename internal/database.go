@@ -28,7 +28,7 @@ ASSET LOT DATA ACCESS
 func GetAssetLotBySymbol(symbol string, openOnly bool) ([]AssetLot, error) {
 	sql := `
 	SELECT
-		id, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
+		id, account, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
 	FROM asset_lots
 	WHERE symbol = ? AND shares > ?
 	ORDER BY cost_basis_per_share DESC;
@@ -47,6 +47,7 @@ func GetAssetLotBySymbol(symbol string, openOnly bool) ([]AssetLot, error) {
 		var assetLot AssetLot
 		err = rows.Scan(
 			&assetLot.ID,
+			&assetLot.AccountID,
 			&assetLot.Symbol,
 			&assetLot.ISIN,
 			&shares,
@@ -68,7 +69,7 @@ func GetAssetLotBySymbol(symbol string, openOnly bool) ([]AssetLot, error) {
 func GetOpenAssetLotsBySymbolBeforeDate(symbol string, date time.Time) ([]AssetLot, error) {
 	sql := `
 	SELECT
-		id, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
+		id, account, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
 	FROM asset_lots
 	WHERE symbol = ? AND shares > 0 AND created_date < ?
 	ORDER BY cost_basis_per_share DESC;
@@ -83,6 +84,7 @@ func GetOpenAssetLotsBySymbolBeforeDate(symbol string, date time.Time) ([]AssetL
 		var assetLot AssetLot
 		err = rows.Scan(
 			&assetLot.ID,
+			&assetLot.AccountID,
 			&assetLot.Symbol,
 			&assetLot.ISIN,
 			&shares,
@@ -104,7 +106,7 @@ func GetOpenAssetLotsBySymbolBeforeDate(symbol string, date time.Time) ([]AssetL
 func GetAssetLotById(id int) (AssetLot, error) {
 	sql := `
 	SELECT
-	id, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
+	id, account, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
 	FROM asset_lots
 	WHERE id = ?;
 	`
@@ -113,6 +115,7 @@ func GetAssetLotById(id int) (AssetLot, error) {
 	var shares, costBasisPerShare int64
 	err := row.Scan(
 		&assetLot.ID,
+		&assetLot.AccountID,
 		&assetLot.Symbol,
 		&assetLot.ISIN,
 		&shares,
@@ -129,23 +132,83 @@ func GetAssetLotById(id int) (AssetLot, error) {
 	return assetLot, err
 }
 
+func getUnMarkedSymbols(beforeDate time.Time) ([]AssetLot, error) {
+	sql := `
+		SELECT id, account, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
+		FROM asset_lots
+		WHERE id NOT IN (select distinct asset_lot_id from market_marks)
+			AND created_date < ? AND shares > 0
+	`
+	var err error
+	var assetLots []AssetLot = []AssetLot{}
+	rows, err := GlobalDB.Query(sql, beforeDate)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var assetLot AssetLot
+		var shares, costBasisPerShare int64
+		err = rows.Scan(
+			&assetLot.ID,
+			&assetLot.AccountID,
+			&assetLot.Symbol,
+			&assetLot.ISIN,
+			&shares,
+			&costBasisPerShare,
+			&assetLot.CostBasisCurrency,
+			&assetLot.CreatedDate,
+		)
+		if err != nil {
+			return nil, err
+		}
+		assetLot.Shares = decimal.New(shares, 4)
+		assetLot.CostBasisPerShare = decimal.New(costBasisPerShare, 4)
+		assetLots = append(assetLots, assetLot)
+	}
+	return assetLots, err
+}
+
+func MarkAssetLot(markDate time.Time, assetLot AssetLot, markedValue *decimal.Big, tx *sql.Tx) error {
+	/*
+		 asset_lot_id 				TEXT
+		,account
+		,market_mark_date			TIMESTAMP
+		,marked_shares
+		,marked_value_per_share 	BIGINT
+		,marked_value_currency		CHAR(3)
+		,gain_loss					BIGINT
+	*/
+	sql := `
+		INSERT INTO market_marks (asset_lot_id, account, market_mark_date, marked_shares, marked_value_per_share, marked_value_currency, gain_loss)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`
+	var shares = getDbDecimalValue(assetLot.Shares)
+	var dbMarkedValue = getDbDecimalValue(markedValue)
+	var gain_loss = getDbDecimalValue(decimal.New(0, 4).Mul(assetLot.Shares, decimal.New(0, 4).Sub(markedValue, assetLot.CostBasisPerShare)).Quantize(4))
+	_, err := tx.Exec(sql, assetLot.ID, assetLot.AccountID, markDate, shares, dbMarkedValue, assetLot.CostBasisCurrency, gain_loss)
+	return err
+}
+
 // InsertAssetLot inserts a asset lot record and then returns the resulting id
 func InsertAssetLot(assetLot AssetLot, tx *sql.Tx) (string, error) {
 	sql := `
 	INSERT INTO asset_lots (
-		id, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
-	) VALUES (?, ?, ?, ?, ?, ?, ?);
+		id, account, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 	`
 	derivedIdCountSQL := `
 	SELECT COUNT(*)+1
 	FROM asset_lots
-	WHERE symbol = ?;
+	WHERE symbol = ? OR isin = ?;
 	`
 
-	derivedId := assetLot.Symbol + assetLot.CreatedDate.Format("-20060102")
+	var ident string = assetLot.Symbol
+	if assetLot.CostBasisCurrency != USD {
+		ident = assetLot.ISIN
+	}
+	derivedId := ident + assetLot.CreatedDate.Format("-20060102")
 	var idCount int
-
-	row := tx.QueryRow(derivedIdCountSQL, assetLot.Symbol)
+	row := tx.QueryRow(derivedIdCountSQL, ident, ident)
 	row.Scan(&idCount)
 	derivedId += fmt.Sprintf("-%06d", idCount)
 
@@ -162,7 +225,7 @@ func InsertAssetLot(assetLot AssetLot, tx *sql.Tx) (string, error) {
 	var costBasisPerShare = getDbDecimalValue(assetLot.CostBasisPerShare)
 	assetLot.ID = derivedId
 	_, err = tx.Exec(sql,
-		derivedId, assetLot.Symbol, assetLot.ISIN, shares,
+		derivedId, assetLot.AccountID, assetLot.Symbol, assetLot.ISIN, shares,
 		costBasisPerShare, assetLot.CostBasisCurrency, assetLot.CreatedDate,
 	)
 	if err != nil {
@@ -183,8 +246,8 @@ func InsertAssetLot(assetLot AssetLot, tx *sql.Tx) (string, error) {
 func InsertAssetLotHistory(assetLot AssetLot, asOfDate time.Time, tx *sql.Tx) error {
 	sql := `
 	INSERT INTO asset_lots_history (
-		id, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, as_of_date
-	) VALUES (?, ?, ?, ?, ?, ?, ?);
+		id, account, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, as_of_date
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 	`
 
 	immediateCommit := false
@@ -199,7 +262,7 @@ func InsertAssetLotHistory(assetLot AssetLot, asOfDate time.Time, tx *sql.Tx) er
 	var shares = getDbDecimalValue(assetLot.Shares)
 	var costBasisPerShare = getDbDecimalValue(assetLot.CostBasisPerShare)
 	_, err = tx.Exec(sql,
-		assetLot.ID, assetLot.Symbol, assetLot.ISIN, shares,
+		assetLot.ID, assetLot.AccountID, assetLot.Symbol, assetLot.ISIN, shares,
 		costBasisPerShare, assetLot.CostBasisCurrency, asOfDate,
 	)
 	if err != nil {
@@ -254,7 +317,7 @@ TRANSACTION DATA ACCESS
 func GetTransactionBetweenDate(startDate time.Time, endDate time.Time) ([]Transaction, error) {
 	sql := `
 	SELECT
-		id, transaction_reference, transaction_type, settlement_date,
+		id, account, transaction_reference, transaction_type, settlement_date,
 		share_lot, shares, price_per_share, share_value, fees_amount,
 		total_amount, currency
 	FROM transactions
@@ -270,6 +333,7 @@ func GetTransactionBetweenDate(startDate time.Time, endDate time.Time) ([]Transa
 		var shares, pricePerShare, shareValue, feesAmount, totalAmount int64
 		err := rows.Scan(
 			&transaction.ID,
+			&transaction.AccountID,
 			&transaction.TransactionReference,
 			&transaction.TransactionType,
 			&transaction.SettlementDate,
@@ -299,7 +363,7 @@ func GetTransactionBetweenDate(startDate time.Time, endDate time.Time) ([]Transa
 func GetTransactionById(id int) (Transaction, error) {
 	sql := `
 	SELECT
-		id, transaction_reference, transaction_type, settlement_date, symbol,
+		id, account, transaction_reference, transaction_type, settlement_date, symbol,
 		share_lot, shares, price_per_share, share_value, fees_amount,
 		total_amount, currency
 	FROM transactions
@@ -310,6 +374,7 @@ func GetTransactionById(id int) (Transaction, error) {
 	var shares, pricePerShare, shareValue, feesAmount, totalAmount int64
 	err := row.Scan(
 		&transaction.ID,
+		&transaction.AccountID,
 		&transaction.TransactionReference,
 		&transaction.TransactionType,
 		&transaction.SettlementDate,
@@ -338,10 +403,10 @@ func GetTransactionById(id int) (Transaction, error) {
 func InsertTransaction(transaction Transaction, tx *sql.Tx) (int, error) {
 	sql := `
 	INSERT INTO transactions (
-		transaction_reference, transaction_type, settlement_date, symbol,
+		account, transaction_reference, transaction_type, settlement_date, symbol,
 		share_lot, shares, price_per_share, share_value, fees_amount,
 		total_amount, currency
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 	`
 	immediateCommit := false
 	var err error
@@ -357,7 +422,7 @@ func InsertTransaction(transaction Transaction, tx *sql.Tx) (int, error) {
 	shareValue := getDbDecimalValue(transaction.ShareValue)
 	feesAmount := getDbDecimalValue(transaction.FeesAmount)
 	totalAmount := getDbDecimalValue(transaction.TotalAmount)
-	result, err := tx.Exec(sql, transaction.TransactionReference, transaction.TransactionType, transaction.SettlementDate,
+	result, err := tx.Exec(sql, transaction.AccountID, transaction.TransactionReference, transaction.TransactionType, transaction.SettlementDate,
 		transaction.Symbol, transaction.ShareLot, shares, pricePerShare, shareValue, feesAmount,
 		totalAmount, transaction.Currency)
 	if err != nil {
@@ -414,6 +479,7 @@ func createTables() {
 	lotsTable := `
 	CREATE TABLE IF NOT EXISTS "asset_lots" (
 		 id                   	TEXT PRIMARY KEY
+		,account				TEXT NOT NULL
 		,symbol				 	TEXT NOT NULL
 		,isin      				TEXT NOT NULL
 		,shares       			BIGINT NOT NULL
@@ -428,6 +494,7 @@ func createTables() {
 	CREATE TABLE IF NOT EXISTS "asset_lots_history" (
 		 int_id                 INTEGER PRIMARY KEY AUTOINCREMENT
 		,id                   	TEXT
+		,account               	TEXT
 		,symbol				 	TEXT NOT NULL
 		,isin      				TEXT NOT NULL
 		,shares       			BIGINT NOT NULL
@@ -441,6 +508,7 @@ func createTables() {
 	transactionsTable := `
 	CREATE TABLE IF NOT EXISTS "transactions" (
 		 id                   	INTEGER PRIMARY KEY AUTOINCREMENT
+		,account			 	TEXT
 		,transaction_reference 	TEXT
 		,transaction_type      	SMALLINT NOT NULL
 		,settlement_date       	TIMESTAMP NOT NULL
@@ -472,8 +540,10 @@ func createTables() {
 	marketMarksTable := `
 		CREATE TABLE IF NOT EXISTS "market_marks" (
 			id                   		INTEGER PRIMARY KEY AUTOINCREMENT
+			,account	 				TEXT
 			,asset_lot_id 				TEXT
 			,market_mark_date			TIMESTAMP
+			,marked_shares				BIGINT
 			,marked_value_per_share 	BIGINT
 			,marked_value_currency		CHAR(3)
 			,gain_loss				 	BIGINT

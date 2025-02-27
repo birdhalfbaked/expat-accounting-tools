@@ -108,6 +108,7 @@ Currency
 */
 type Transaction struct {
 	ID                   int
+	AccountID            string
 	TransactionReference string
 	TransactionType      TransactionType
 	SettlementDate       time.Time
@@ -127,6 +128,7 @@ type Transaction struct {
 func (t Transaction) CopyFromShares(newShares *decimal.Big) Transaction {
 	return Transaction{
 		t.ID,
+		t.AccountID,
 		t.TransactionReference,
 		t.TransactionType,
 		t.SettlementDate,
@@ -143,6 +145,7 @@ func (t Transaction) CopyFromShares(newShares *decimal.Big) Transaction {
 
 type AssetLot struct {
 	ID                string
+	AccountID         string
 	Symbol            string
 	ISIN              string
 	Shares            *decimal.Big

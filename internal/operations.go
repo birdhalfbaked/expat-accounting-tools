@@ -1,8 +1,17 @@
 package internal
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+
 	"github.com/ericlagergren/decimal"
 )
+
+var ErrNoSymbolFound = errors.New("no symbol found")
 
 func HandleImport(records []ImportRecord) error {
 	for _, record := range records {
@@ -249,4 +258,131 @@ func handleTransferOutImport(record ImportRecord) error {
 	}
 	err = tx.Commit()
 	return err
+}
+
+type StockPriceResponse struct {
+	Chart struct {
+		Result []struct {
+			Indicators struct {
+				Adjclose []struct {
+					AdjClose []float64
+				}
+			}
+		}
+	}
+}
+
+type SymbolSearchResponse struct {
+	Quotes []struct {
+		Symbol string
+	}
+}
+
+func getReq(url string) *http.Request {
+	req, _ := http.NewRequest("GET", url, nil)
+	req.AddCookie(&http.Cookie{Name: "_cb_svref", Value: "https%3A%2F%2Ffinance.yahoo.com%2Fquote%2FSSAB-B.ST%2F"})
+	req.Header.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36")
+	return req
+}
+
+func RetrieveStockPrice(assetLot AssetLot, valueDate time.Time) (*decimal.Big, error) {
+	PriceUrlBase := "https://query2.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1d&includePrePost=true&lang=en-US&region=SE"
+	SearchUrlBase := "https://query2.finance.yahoo.com/v1/finance/search?q=%s&lang=en-US&region=US"
+	var symbol = assetLot.Symbol
+	if assetLot.CostBasisCurrency != USD {
+		// if not US, we need to do a search on ISIN
+		searchData := SymbolSearchResponse{}
+		resp, err := http.DefaultClient.Do(getReq(fmt.Sprintf(SearchUrlBase, assetLot.ISIN)))
+		if err != nil {
+			ErrLogger.Println(err)
+			return nil, err
+		}
+		searchBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			ErrLogger.Println(err)
+			return nil, err
+		}
+		err = json.Unmarshal(searchBytes, &searchData)
+		if err != nil {
+			ErrLogger.Println(err)
+			return nil, err
+		}
+		if len(searchData.Quotes) > 0 {
+			symbol = searchData.Quotes[0].Symbol
+		} else {
+			return nil, ErrNoSymbolFound
+		}
+	}
+
+	unixTime := valueDate.Unix()
+	formattedUrl := fmt.Sprintf(PriceUrlBase, symbol, unixTime, unixTime+80000)
+	var stockPrice StockPriceResponse
+	response, err := http.DefaultClient.Do(getReq(formattedUrl))
+	if err != nil {
+		ErrLogger.Println(err)
+		return nil, err
+	}
+	data, err := io.ReadAll(response.Body)
+	if err != nil {
+		ErrLogger.Println(err)
+		return nil, err
+	}
+	err = json.Unmarshal(data, &stockPrice)
+	if err != nil {
+		ErrLogger.Println(err, string(data))
+		return nil, err
+	}
+	stringedClose := fmt.Sprintf("%.4f", stockPrice.Chart.Result[0].Indicators.Adjclose[0].AdjClose[0])
+	InfoLogger.Println(stringedClose)
+	value, err := ProcessStringAmount(stringedClose, US)
+	if err != nil {
+		ErrLogger.Println(err)
+		return nil, err
+	}
+	return value, err
+}
+
+func MarkStocks(date time.Time) {
+	prices := make(map[string]*decimal.Big)
+	prices["TRACKER GULD NORDNET"] = decimal.New(2426500, 4)
+	lots, err := getUnMarkedSymbols(date)
+	if err != nil {
+		ErrLogger.Println(err)
+		return
+	}
+	// start tx
+	tx, err := GlobalDB.Begin()
+	if err != nil {
+		panic("can't do transaction")
+	}
+	for _, lot := range lots {
+		marketPrice, ok := prices[lot.Symbol]
+		if !ok {
+			InfoLogger.Printf("retrieving price for %s\n", lot.Symbol)
+			price, err := RetrieveStockPrice(lot, date)
+			if err != nil {
+				if err == ErrNoSymbolFound {
+					InfoLogger.Println("Skipping non-equity")
+					continue
+				}
+				ErrLogger.Println(err)
+				panic("uh oh")
+			}
+			// sleep to avoid ban from
+			time.Sleep(1 * time.Second)
+			prices[lot.Symbol] = price
+			marketPrice = price
+		}
+		err = MarkAssetLot(date, lot, marketPrice, tx)
+		if err != nil {
+			ErrLogger.Println(err)
+			tx.Rollback()
+			panic("uh oh")
+		}
+	}
+	err = tx.Commit()
+	if err != nil {
+		tx.Rollback()
+		panic("wtf")
+	}
 }

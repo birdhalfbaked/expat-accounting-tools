@@ -8,7 +8,7 @@ import (
 
 func TestReadNordnetExport(t *testing.T) {
 	// Use fake file
-	records, _ := internal.ReadNordnetExport("../testing/nordnet-transactions.csv")
+	records, _ := internal.ReadNordnetExport("../testing/nordnet-transactions.csv", "1234")
 	for _, v := range records {
 		log.Printf("%#v\n", v)
 	}

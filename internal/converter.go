@@ -193,7 +193,7 @@ func TransformNordnetTransaction(transaction NordnetTransaction) (ImportRecord, 
 	return ImportRecord{lot: mappedAssetLot, transaction: mappedTransaction}, nil
 }
 
-func ReadNordnetExport(filepath string) ([]ImportRecord, error) {
+func ReadNordnetExport(filepath string, accountNumber string) ([]ImportRecord, error) {
 	file, err := os.Open(filepath)
 	if err != nil {
 		return nil, err
@@ -225,6 +225,8 @@ func ReadNordnetExport(filepath string) ([]ImportRecord, error) {
 		if err != nil {
 			return nil, err
 		}
+		transformedRecord.lot.AccountID = accountNumber
+		transformedRecord.transaction.AccountID = accountNumber
 		result = append(result, transformedRecord)
 	}
 	sort.SliceStable(result, func(i, j int) bool {
@@ -361,7 +363,7 @@ func TransformETradeTransaction(transaction ETradeTransaction) (ImportRecord, er
 	return ImportRecord{lot: mappedAssetLot, transaction: mappedTransaction}, nil
 }
 
-func ReadETradeExport(filepath string) ([]ImportRecord, error) {
+func ReadETradeExport(filepath string, accountNumber string) ([]ImportRecord, error) {
 	file, err := os.Open(filepath)
 	if err != nil {
 		return nil, err
@@ -388,6 +390,8 @@ func ReadETradeExport(filepath string) ([]ImportRecord, error) {
 		if err != nil {
 			return nil, err
 		}
+		transformedRecord.lot.AccountID = accountNumber
+		transformedRecord.transaction.AccountID = accountNumber
 		result = append(result, transformedRecord)
 	}
 	sort.SliceStable(result, func(i, j int) bool {
