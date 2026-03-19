@@ -146,6 +146,7 @@ func (t Transaction) CopyFromShares(newShares *decimal.Big) Transaction {
 type AssetLot struct {
 	ID                string
 	AccountID         string
+	Exchange          string
 	Symbol            string
 	ISIN              string
 	Shares            *decimal.Big

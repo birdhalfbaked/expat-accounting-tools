@@ -162,6 +162,7 @@ func TransformNordnetTransaction(transaction NordnetTransaction) (ImportRecord, 
 
 	var mappedAssetLot = AssetLot{
 		ID:                "",
+		Exchange:          "Nasdaq OMX Stockholm AB", // Nordnet → Stockholm exchange
 		Symbol:            transaction.Värdepapper,
 		ISIN:              transaction.ISIN,
 		Shares:            shares,
@@ -238,7 +239,6 @@ func ReadNordnetExport(filepath string, accountNumber string) ([]ImportRecord, e
 type ETradeTransaction struct {
 	TransactionDate string
 	TransactionType string
-	SecurityType    string
 	Symbol          string
 	Quantity        string
 	Amount          string
@@ -325,6 +325,7 @@ func TransformETradeTransaction(transaction ETradeTransaction) (ImportRecord, er
 
 	var mappedAssetLot = AssetLot{
 		ID:                "",
+		Exchange:          "Nasdaq", // E*TRADE US equities default
 		Symbol:            transaction.Symbol,
 		ISIN:              "",
 		Shares:            shares,
@@ -381,8 +382,14 @@ func ReadETradeExport(filepath string, accountNumber string) ([]ImportRecord, er
 			return nil, err
 		}
 		transformedRecord, err := TransformETradeTransaction(ETradeTransaction{
-			record[0], record[1], record[2], record[3], record[4], record[5],
-			record[6], record[7], record[8],
+			TransactionDate: record[1],
+			TransactionType: record[3],
+			Description:     record[4],
+			Symbol:          record[5],
+			Quantity:        record[7],
+			Price:           record[8],
+			Amount:          record[9],
+			Commission:      record[10],
 		})
 		if err == ErrUnhandledTransactionType {
 			continue

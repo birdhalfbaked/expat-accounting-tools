@@ -1,11 +1,14 @@
 package internal
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/ericlagergren/decimal"
@@ -71,7 +74,7 @@ func handlePurchaseImport(record ImportRecord) error {
 	}
 	lotId, err := InsertAssetLot(record.lot, tx)
 	if err != nil {
-		ErrLogger.Fatal(err)
+		ErrLogger.Fatal(err, record)
 		return err
 	}
 	record.lot.ID = lotId
@@ -286,36 +289,46 @@ func getReq(url string) *http.Request {
 }
 
 func RetrieveStockPrice(assetLot AssetLot, valueDate time.Time) (*decimal.Big, error) {
-	PriceUrlBase := "https://query2.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1d&includePrePost=true&lang=en-US&region=SE"
+	yahooSymbol, err := ResolveYahooSymbol(assetLot)
+	if err != nil {
+		return nil, err
+	}
+	return RetrieveStockPriceByYahooSymbol(yahooSymbol, valueDate)
+}
+
+func ResolveYahooSymbol(assetLot AssetLot) (string, error) {
 	SearchUrlBase := "https://query2.finance.yahoo.com/v1/finance/search?q=%s&lang=en-US&region=US"
-	var symbol = assetLot.Symbol
+	symbol := assetLot.Symbol
 	if assetLot.CostBasisCurrency != USD {
-		// if not US, we need to do a search on ISIN
+		// If not US, do a search using ISIN.
 		searchData := SymbolSearchResponse{}
 		resp, err := http.DefaultClient.Do(getReq(fmt.Sprintf(SearchUrlBase, assetLot.ISIN)))
 		if err != nil {
 			ErrLogger.Println(err)
-			return nil, err
+			return "", err
 		}
 		searchBytes, err := io.ReadAll(resp.Body)
 		if err != nil {
 			ErrLogger.Println(err)
-			return nil, err
+			return "", err
 		}
-		err = json.Unmarshal(searchBytes, &searchData)
-		if err != nil {
+		if err := json.Unmarshal(searchBytes, &searchData); err != nil {
 			ErrLogger.Println(err)
-			return nil, err
+			return "", err
 		}
-		if len(searchData.Quotes) > 0 {
+		if len(searchData.Quotes) > 0 && strings.TrimSpace(searchData.Quotes[0].Symbol) != "" {
 			symbol = searchData.Quotes[0].Symbol
 		} else {
-			return nil, ErrNoSymbolFound
+			return "", ErrNoSymbolFound
 		}
 	}
+	return symbol, nil
+}
 
+func RetrieveStockPriceByYahooSymbol(yahooSymbol string, valueDate time.Time) (*decimal.Big, error) {
+	PriceUrlBase := "https://query2.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1d&includePrePost=true&lang=en-US&region=SE"
 	unixTime := valueDate.Unix()
-	formattedUrl := fmt.Sprintf(PriceUrlBase, symbol, unixTime, unixTime+80000)
+	formattedUrl := fmt.Sprintf(PriceUrlBase, yahooSymbol, unixTime, unixTime+80000)
 	var stockPrice StockPriceResponse
 	response, err := http.DefaultClient.Do(getReq(formattedUrl))
 	if err != nil {
@@ -327,24 +340,36 @@ func RetrieveStockPrice(assetLot AssetLot, valueDate time.Time) (*decimal.Big, e
 		ErrLogger.Println(err)
 		return nil, err
 	}
-	err = json.Unmarshal(data, &stockPrice)
-	if err != nil {
+	if err := json.Unmarshal(data, &stockPrice); err != nil {
 		ErrLogger.Println(err, string(data))
 		return nil, err
 	}
-	stringedClose := fmt.Sprintf("%.4f", stockPrice.Chart.Result[0].Indicators.Adjclose[0].AdjClose[0])
+
+	// Yahoo may return empty chart results for non-equities / unknown symbols.
+	if len(stockPrice.Chart.Result) == 0 {
+		return nil, ErrNoSymbolFound
+	}
+	first := stockPrice.Chart.Result[0]
+	if len(first.Indicators.Adjclose) == 0 || len(first.Indicators.Adjclose[0].AdjClose) == 0 {
+		return nil, ErrNoSymbolFound
+	}
+
+	stringedClose := fmt.Sprintf("%.4f", first.Indicators.Adjclose[0].AdjClose[0])
 	InfoLogger.Println(stringedClose)
 	value, err := ProcessStringAmount(stringedClose, US)
 	if err != nil {
 		ErrLogger.Println(err)
 		return nil, err
 	}
-	return value, err
+	return value, nil
 }
 
 func MarkStocks(date time.Time) {
+	// Cache by resolved Yahoo symbol so different lot symbols that map to the same Yahoo symbol
+	// don't trigger repeated HTTP requests.
 	prices := make(map[string]*decimal.Big)
-	prices["TRACKER GULD NORDNET"] = decimal.New(2426500, 4)
+	nonEquitySymbols := make(map[string]bool)
+	reader := bufio.NewReader(os.Stdin)
 	lots, err := getUnMarkedSymbols(date)
 	if err != nil {
 		ErrLogger.Println(err)
@@ -356,33 +381,177 @@ func MarkStocks(date time.Time) {
 		panic("can't do transaction")
 	}
 	for _, lot := range lots {
-		marketPrice, ok := prices[lot.Symbol]
-		if !ok {
-			InfoLogger.Printf("retrieving price for %s\n", lot.Symbol)
-			price, err := RetrieveStockPrice(lot, date)
-			if err != nil {
-				if err == ErrNoSymbolFound {
+		resolveKey := lot.Symbol
+		if lot.CostBasisCurrency != USD {
+			resolveKey = lot.ISIN
+		}
+		if nonEquitySymbols[resolveKey] {
+			continue
+		}
+
+		// If we already have a (manual or cached) price, don't resolve / fetch again.
+		if cached, ok := prices[resolveKey]; ok {
+			if err := MarkAssetLot(date, lot, cached, tx); err != nil {
+				ErrLogger.Println(err)
+				tx.Rollback()
+				return
+			}
+			continue
+		}
+
+		// Hardcoded special case from earlier behavior.
+		if lot.Symbol == "TRACKER GULD NORDNET" {
+			marketPrice := decimal.New(2426500, 4)
+			if err := MarkAssetLot(date, lot, marketPrice, tx); err != nil {
+				ErrLogger.Println(err)
+				tx.Rollback()
+				return
+			}
+			continue
+		}
+
+		yahooSymbol, err := ResolveYahooSymbol(lot)
+		if err != nil {
+			if err == ErrNoSymbolFound {
+				manualPrice, promptErr := promptManualPrice(lot, date, reader, "symbol not found from Yahoo")
+				if promptErr != nil {
+					ErrLogger.Println(promptErr)
+					tx.Rollback()
+					return
+				}
+				if manualPrice == nil {
+					nonEquitySymbols[resolveKey] = true
 					InfoLogger.Println("Skipping non-equity")
 					continue
 				}
-				ErrLogger.Println(err)
-				panic("uh oh")
+				// Cache manual answer.
+				prices[resolveKey] = manualPrice
+				// If we can't resolve a Yahoo symbol, we can't populate yahooSymbol-based caches.
+				if err := MarkAssetLot(date, lot, manualPrice, tx); err != nil {
+					ErrLogger.Println(err)
+					tx.Rollback()
+					return
+				}
+				continue
 			}
-			// sleep to avoid ban from
-			time.Sleep(1 * time.Second)
-			prices[lot.Symbol] = price
-			marketPrice = price
+			// For other errors (network/JSON/etc) we still offer a manual override.
+			manualPrice, promptErr := promptManualPrice(lot, date, reader, err.Error())
+			if promptErr != nil {
+				ErrLogger.Println(promptErr)
+				tx.Rollback()
+				return
+			}
+			if manualPrice == nil {
+				nonEquitySymbols[resolveKey] = true
+				ErrLogger.Println("Skipping due to Yahoo resolution error (manual price blank)")
+				continue
+			}
+			prices[resolveKey] = manualPrice
+			if err := MarkAssetLot(date, lot, manualPrice, tx); err != nil {
+				ErrLogger.Println(err)
+				tx.Rollback()
+				return
+			}
+			continue
 		}
+
+		if nonEquitySymbols[yahooSymbol] {
+			continue
+		}
+
+		marketPrice, ok := prices[yahooSymbol]
+		if !ok {
+			InfoLogger.Printf("retrieving price for %s (%s)\n", lot.Symbol, yahooSymbol)
+			price, err := RetrieveStockPriceByYahooSymbol(yahooSymbol, date)
+			if err != nil {
+				if err == ErrNoSymbolFound {
+					manualPrice, promptErr := promptManualPrice(lot, date, reader, "price not found from Yahoo")
+					if promptErr != nil {
+						ErrLogger.Println(promptErr)
+						tx.Rollback()
+						return
+					}
+					if manualPrice == nil {
+						nonEquitySymbols[resolveKey] = true
+						nonEquitySymbols[yahooSymbol] = true
+						InfoLogger.Println("Skipping non-equity")
+						continue
+					}
+					prices[resolveKey] = manualPrice
+					prices[yahooSymbol] = manualPrice
+					marketPrice = manualPrice
+				} else {
+					// Other Yahoo errors: prompt for a manual override.
+					manualPrice, promptErr := promptManualPrice(lot, date, reader, err.Error())
+					if promptErr != nil {
+						ErrLogger.Println(promptErr)
+						tx.Rollback()
+						return
+					}
+					if manualPrice == nil {
+						nonEquitySymbols[resolveKey] = true
+						nonEquitySymbols[yahooSymbol] = true
+						ErrLogger.Println("Skipping due to Yahoo price error (manual price blank)")
+						continue
+					}
+					prices[resolveKey] = manualPrice
+					prices[yahooSymbol] = manualPrice
+					marketPrice = manualPrice
+				}
+			} else {
+				// sleep to avoid ban from
+				time.Sleep(1 * time.Second)
+				prices[yahooSymbol] = price
+				prices[resolveKey] = price
+				marketPrice = price
+			}
+		} else {
+			// Cached by yahooSymbol, also store under resolveKey for consistent future hits.
+			prices[resolveKey] = marketPrice
+		}
+
 		err = MarkAssetLot(date, lot, marketPrice, tx)
 		if err != nil {
 			ErrLogger.Println(err)
 			tx.Rollback()
-			panic("uh oh")
+			return
 		}
 	}
 	err = tx.Commit()
 	if err != nil {
 		tx.Rollback()
-		panic("wtf")
+		return
+	}
+}
+
+func promptManualPrice(assetLot AssetLot, date time.Time, reader *bufio.Reader, reason string) (*decimal.Big, error) {
+	example := "0.00"
+	if assetLot.CostBasisCurrency == SEK {
+		example = "0,00"
+	}
+
+	for {
+		if reason != "" {
+			fmt.Printf("Yahoo price unavailable for %s (ISIN=%s, %s). Enter manual price per share in %s (format like %s; blank to skip): ",
+				assetLot.Symbol, assetLot.ISIN, reason, assetLot.CostBasisCurrency, example)
+		} else {
+			fmt.Printf("Yahoo price not found for %s (ISIN=%s). Enter manual price per share in %s (format like %s; blank to skip): ",
+				assetLot.Symbol, assetLot.ISIN, assetLot.CostBasisCurrency, example)
+		}
+		text, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return nil, nil
+		}
+
+		val, err := parseReportDecimal(text, assetLot.CostBasisCurrency)
+		if err != nil {
+			fmt.Printf("Invalid number. %v\n", err)
+			continue
+		}
+		return val, nil
 	}
 }

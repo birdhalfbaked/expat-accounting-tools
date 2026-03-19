@@ -1,1 +1,5 @@
 *.db
+data/*
+!data/.gitkeep
+reporting/*
+!reporting/.gitkeep

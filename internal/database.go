@@ -28,7 +28,7 @@ ASSET LOT DATA ACCESS
 func GetAssetLotBySymbol(symbol string, openOnly bool) ([]AssetLot, error) {
 	sql := `
 	SELECT
-		id, account, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
+		id, account, exchange, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
 	FROM asset_lots
 	WHERE symbol = ? AND shares > ?
 	ORDER BY cost_basis_per_share DESC;
@@ -48,6 +48,7 @@ func GetAssetLotBySymbol(symbol string, openOnly bool) ([]AssetLot, error) {
 		err = rows.Scan(
 			&assetLot.ID,
 			&assetLot.AccountID,
+			&assetLot.Exchange,
 			&assetLot.Symbol,
 			&assetLot.ISIN,
 			&shares,
@@ -69,7 +70,7 @@ func GetAssetLotBySymbol(symbol string, openOnly bool) ([]AssetLot, error) {
 func GetOpenAssetLotsBySymbolBeforeDate(symbol string, date time.Time) ([]AssetLot, error) {
 	sql := `
 	SELECT
-		id, account, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
+		id, account, exchange, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
 	FROM asset_lots
 	WHERE symbol = ? AND shares > 0 AND created_date < ?
 	ORDER BY cost_basis_per_share DESC;
@@ -85,6 +86,7 @@ func GetOpenAssetLotsBySymbolBeforeDate(symbol string, date time.Time) ([]AssetL
 		err = rows.Scan(
 			&assetLot.ID,
 			&assetLot.AccountID,
+			&assetLot.Exchange,
 			&assetLot.Symbol,
 			&assetLot.ISIN,
 			&shares,
@@ -106,7 +108,7 @@ func GetOpenAssetLotsBySymbolBeforeDate(symbol string, date time.Time) ([]AssetL
 func GetAssetLotById(id int) (AssetLot, error) {
 	sql := `
 	SELECT
-	id, account, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
+		id, account, exchange, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
 	FROM asset_lots
 	WHERE id = ?;
 	`
@@ -116,6 +118,7 @@ func GetAssetLotById(id int) (AssetLot, error) {
 	err := row.Scan(
 		&assetLot.ID,
 		&assetLot.AccountID,
+		&assetLot.Exchange,
 		&assetLot.Symbol,
 		&assetLot.ISIN,
 		&shares,
@@ -134,7 +137,7 @@ func GetAssetLotById(id int) (AssetLot, error) {
 
 func getUnMarkedSymbols(beforeDate time.Time) ([]AssetLot, error) {
 	sql := `
-		SELECT id, account, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
+		SELECT id, account, exchange, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
 		FROM asset_lots
 		WHERE id NOT IN (select distinct asset_lot_id from market_marks)
 			AND created_date < ? AND shares > 0
@@ -151,6 +154,7 @@ func getUnMarkedSymbols(beforeDate time.Time) ([]AssetLot, error) {
 		err = rows.Scan(
 			&assetLot.ID,
 			&assetLot.AccountID,
+			&assetLot.Exchange,
 			&assetLot.Symbol,
 			&assetLot.ISIN,
 			&shares,
@@ -193,8 +197,8 @@ func MarkAssetLot(markDate time.Time, assetLot AssetLot, markedValue *decimal.Bi
 func InsertAssetLot(assetLot AssetLot, tx *sql.Tx) (string, error) {
 	sql := `
 	INSERT INTO asset_lots (
-		id, account, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+		id, account, exchange, symbol, isin, shares, cost_basis_per_share, cost_basis_currency, created_date
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
 	`
 	derivedIdCountSQL := `
 	SELECT COUNT(*)+1
@@ -225,7 +229,7 @@ func InsertAssetLot(assetLot AssetLot, tx *sql.Tx) (string, error) {
 	var costBasisPerShare = getDbDecimalValue(assetLot.CostBasisPerShare)
 	assetLot.ID = derivedId
 	_, err = tx.Exec(sql,
-		derivedId, assetLot.AccountID, assetLot.Symbol, assetLot.ISIN, shares,
+		derivedId, assetLot.AccountID, assetLot.Exchange, assetLot.Symbol, assetLot.ISIN, shares,
 		costBasisPerShare, assetLot.CostBasisCurrency, assetLot.CreatedDate,
 	)
 	if err != nil {
@@ -453,15 +457,20 @@ func UpdateRates() {
 		UNION ALL
 		SELECT 'USD', 10000, '2024-12-31'
 		UNION ALL
+		SELECT 'USD', 10000, '2025-12-31'
+		UNION ALL
 		SELECT 'SEK', 101220, '2022-12-31'
 		UNION ALL
 		SELECT 'SEK', 106130, '2023-12-31'
 		UNION ALL
 		SELECT 'SEK', 105770, '2024-12-31'
+		UNION ALL
+		SELECT 'SEK', 98130, '2025-12-31'
 	`
 	tx, _ := GlobalDB.Begin()
 	tx.Exec(supportedCurrenciesInsert)
 	tx.Exec(insertCurrencyRatesTable)
+	tx.Commit()
 }
 
 /*
@@ -480,6 +489,7 @@ func createTables() {
 	CREATE TABLE IF NOT EXISTS "asset_lots" (
 		 id                   	TEXT PRIMARY KEY
 		,account				TEXT NOT NULL
+		,exchange				TEXT NOT NULL DEFAULT ''
 		,symbol				 	TEXT NOT NULL
 		,isin      				TEXT NOT NULL
 		,shares       			BIGINT NOT NULL
@@ -561,6 +571,9 @@ func createTables() {
 	if err != nil {
 		ErrLogger.Fatal(err)
 	}
+	// Backfill existing DBs (older `asset_lots` tables) with the new column.
+	// SQLite returns an error if the column already exists; ignore it.
+	_, _ = tx.Exec(`ALTER TABLE asset_lots ADD COLUMN exchange TEXT NOT NULL DEFAULT '';`)
 	_, err = tx.Exec(lotsHistoryTable)
 	if err != nil {
 		ErrLogger.Fatal(err)
