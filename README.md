@@ -2,6 +2,12 @@
 
 A local CLI for importing broker transactions, marking holdings to market, and exporting reporting-ready CSVs.
 
+> **Scope:** This tool is intended for **US expats living in Sweden** only.
+>
+> **Personal-use status:** This project is built for my own personal workflow and is **not** a general-purpose tax/accounting product.
+>
+> **Verification required:** All outputs (cost basis, gains/losses, FX conversions, and reporting files) must be independently reviewed and validated by the end user.
+
 ## Requirements
 
 - Go `1.23.1+`
